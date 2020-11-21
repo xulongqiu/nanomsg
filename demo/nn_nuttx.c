@@ -12,8 +12,6 @@
  * @date:    2020-11-18 13:21:27
  */
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <poll.h>
@@ -22,7 +20,11 @@
 #include <sys/prctl.h>
 #include <nanomsg/nn.h>
 #include <nanomsg/reqrep.h>
-#include <stdbool.h>
+#include <nanomsg/pubsub.h>
+
+#include "nn_nuttx.h"
+
+#define NN_NUTTX_TOPIC_NAME_LEN 15
 
 typedef struct nn_trans_hdr {
     int seq;
@@ -30,15 +32,6 @@ typedef struct nn_trans_hdr {
     size_t len;
     unsigned char* data[];
 } nn_trans_hdr_t;
-
-typedef struct nn_trans_data {
-    const void* in;
-    size_t      in_size;
-    void*       out;
-    size_t      out_size;
-} nn_trans_data_t;
-
-typedef int (*on_transaction)(const void* cookie, const int code, nn_trans_data_t* data);
 
 typedef enum {
     NN_NUTTX_MODE_REQREP = 0,
@@ -49,16 +42,14 @@ typedef enum {
 } nn_nuttx_mode_t;
 
 typedef enum {
-    NN_NUTTX_PROTOCOL_INPROC = 0,
-    NN_NUTTX_PROTOCOL_IPC,
-    NN_NUTTX_PROTOCOL_TCP,
+    NN_NUTTX_TRANS_TYPE_INPROC = 0,
+    NN_NUTTX_TRANS_TYPE_IPC,
+    NN_NUTTX_TRANS_TYPE_TCP,
 
-    NN_NUTTX_PROTOCOL_MAX
-} nn_nuttx_protocol_t;
+    NN_NUTTX_TRANS_TYPE_MAX
+} nn_nuttx_trans_type_t;
 
 typedef struct nn_server_ctx {
-    nn_nuttx_mode_t mode;
-    nn_nuttx_mode_t protocol;
     char* name;
     int fd;
     on_transaction on_trans_cb;
@@ -72,9 +63,59 @@ typedef struct nn_client_ctx {
     int fd;
 } nn_client_ctx_t;
 
-const char* const nn_nuttx_protocol_str[] = {
+typedef struct nn_pub_ctx {
+    char* name;
+    int fd;
+} nn_pub_ctx_t;
+
+typedef struct nn_sub_ctx {
+    char* name;
+    int fd;
+    on_topic_listener listener;
+    pthread_t tid;
+    bool actived;
+    void* priv;
+} nn_sub_ctx_t;
+
+typedef struct nn_nuttx_topic {
+    uint8_t topic[NN_NUTTX_TOPIC_NAME_LEN + 1];
+    size_t content_len;
+    uint8_t content[];
+} nn_nuttx_topic_t;
+
+const char* const nn_nuttx_trans_prefix_str[] = {
     "inproc://", "ipc://", "tcp://"
 };
+
+static int nn_socket_bind(int* fd, const char* name, int af, int protocol)
+{
+    *fd = nn_socket(af, protocol);
+
+    if (*fd < 0) {
+        return nn_errno();
+    }
+
+    if (nn_bind(*fd, name) < 0) {
+        return nn_errno();
+    }
+
+    return 0;
+}
+
+static int nn_socket_connect(int* fd, const char* name, int af, int protocol)
+{
+    *fd = nn_socket(af, protocol);
+
+    if (*fd < 0) {
+        return nn_errno();
+    }
+
+    if (nn_connect(*fd, name) < 0) {
+        return nn_errno();
+    }
+
+    return 0;
+}
 
 static void* nn_server_worker(void* arg)
 {
@@ -181,15 +222,14 @@ static void* nn_server_worker(void* arg)
     return NULL;
 }
 
-void* nn_server_create(const char* name, nn_nuttx_mode_t mode, nn_nuttx_protocol_t protocol)
+void* nn_server_create(const char* name)
 {
     nn_server_ctx_t* ctx = NULL;
+    const nn_nuttx_trans_type_t trans_type = NN_NUTTX_TRANS_TYPE_INPROC;
     int name_len = strlen(name);
     int ret = 0;
 
-    if (name_len <= 0
-        || mode < 0 || mode > NN_NUTTX_MODE_MAX
-        || protocol < 0 || protocol > NN_NUTTX_PROTOCOL_MAX) {
+    if (name_len <= 0) {
         ret = -EINVAL;
         goto err;
     }
@@ -202,29 +242,19 @@ void* nn_server_create(const char* name, nn_nuttx_mode_t mode, nn_nuttx_protocol
     }
 
     ctx->fd = -1;
-    ctx->name = calloc(1, strlen(nn_nuttx_protocol_str[protocol] + name_len + 1));
+    ctx->name = calloc(1, strlen(nn_nuttx_trans_prefix_str[trans_type] + name_len + 1));
 
     if (ctx->name == NULL) {
         ret = -ENOMEM;
         goto err;
     }
 
-    strcpy(ctx->name, nn_nuttx_protocol_str[protocol]);
+    strcpy(ctx->name, nn_nuttx_trans_prefix_str[trans_type]);
     strcat(ctx->name, name);
 
-    ctx->fd = nn_socket(AF_SP_RAW, NN_REP);
+    ret = nn_socket_bind(&ctx->fd, ctx->name, AF_SP_RAW, NN_REP);
 
-    if (ctx->fd < 0) {
-        ret = nn_errno();
-        goto err;
-    }
-
-    /*  Bind to the URL.  This will bind to the address and listen
-        synchronously; new clients will be accepted asynchronously
-        without further action from the calling program. */
-
-    if (nn_bind(ctx->fd, ctx->name) < 0) {
-        ret = nn_errno();
+    if (ret < 0) {
         goto err;
     }
 
@@ -236,7 +266,7 @@ void* nn_server_create(const char* name, nn_nuttx_mode_t mode, nn_nuttx_protocol
     }
 
 err:
-    fprintf(stderr, "%s.ret=%d\n", __func__, ret);
+    fprintf(stderr, "%s.ret=%d(%s)\n", __func__, ret, nn_strerror(ret));
 
     if (ctx != NULL) {
         if (ctx->fd != 0) {
@@ -253,11 +283,12 @@ err:
     return NULL;
 }
 
-void nn_server_set_transaction_cb(void* nn_server_ctx, void* cb)
+void nn_server_set_transaction_cb(void* nn_server_ctx, on_transaction cb, void* cb_priv)
 {
     if (nn_server_ctx != NULL && cb != NULL) {
         nn_server_ctx_t* ctx = (nn_server_ctx_t*)nn_server_ctx;
         ctx->on_trans_cb = cb;
+        ctx->priv = cb_priv;
     }
 }
 
@@ -284,15 +315,14 @@ int nn_server_release(void* nn_server_ctx)
 }
 
 
-void* nn_client_connect(const char* server_name, nn_nuttx_mode_t mode, nn_nuttx_protocol_t protocol)
+void* nn_client_connect(const char* server_name)
 {
+    int ret = 0;
     nn_client_ctx_t* ctx = NULL;
     int name_len = strlen(server_name);
-    int ret = 0;
+    const nn_nuttx_trans_type_t trans_type = NN_NUTTX_TRANS_TYPE_INPROC;
 
-    if (name_len <= 0
-        || mode < 0 || mode > NN_NUTTX_MODE_MAX
-        || protocol < 0 || protocol > NN_NUTTX_PROTOCOL_MAX) {
+    if (name_len <= 0) {
         ret = -EINVAL;
         goto err;
     }
@@ -304,34 +334,26 @@ void* nn_client_connect(const char* server_name, nn_nuttx_mode_t mode, nn_nuttx_
         goto err;
     }
 
-    ctx->name = calloc(1, strlen(nn_nuttx_protocol_str[protocol] + name_len + 1));
+    ctx->name = calloc(1, strlen(nn_nuttx_trans_prefix_str[trans_type] + name_len + 1));
 
     if (ctx->name == NULL) {
         ret = -ENOMEM;
         goto err;
     }
 
-    strcpy(ctx->name, nn_nuttx_protocol_str[protocol]);
+    strcpy(ctx->name, nn_nuttx_trans_prefix_str[trans_type]);
     strcat(ctx->name, server_name);
 
-    ctx->fd = nn_socket(AF_SP, NN_REQ);
-
-    if (ctx->fd < 0) {
-        ret = nn_errno();
-        goto err;
-    }
-
-    ret = nn_connect(ctx->fd, ctx->name);
+    ret = nn_socket_connect(&ctx->fd, ctx->name, AF_SP, NN_REQ);
 
     if (ret < 0) {
-        fprintf(stderr, "%s: %s\n", __func__, nn_strerror(nn_errno()));
         goto err;
     }
 
     return ctx;
 
 err:
-    fprintf(stderr, "%s.ret=%d\n", __func__, ret);
+    fprintf(stderr, "%s.ret=%d(%s)\n", __func__, ret, nn_strerror(ret));
 
     if (ctx != NULL) {
         if (ctx->fd != 0) {
@@ -367,7 +389,7 @@ int nn_client_disconnect(void* nn_client_ctx)
     }
 }
 
-int nn_client_transaction(const void* nn_client_ctx, int op_type, const void* in, int in_len, void* out, int out_len)
+int nn_client_transaction(const void* nn_client_ctx, int op_code, const void* in, int in_len, void* out, int out_len)
 {
     int ret = 0;
     nn_trans_hdr_t* trans_hdr;
@@ -393,7 +415,7 @@ int nn_client_transaction(const void* nn_client_ctx, int op_type, const void* in
 
     trans_hdr = (nn_trans_hdr_t*)data;
     trans_hdr->len = in_len;
-    trans_hdr->op_code = op_type;
+    trans_hdr->op_code = op_code;
 
     if (in != NULL && in_len > 0) {
         memcpy(data + sizeof(nn_trans_hdr_t), in, in_len);
@@ -427,6 +449,7 @@ int nn_client_transaction(const void* nn_client_ctx, int op_type, const void* in
         ret = -EINVAL;
     } else {
         trans_hdr = (nn_trans_hdr_t*)body;
+
         if (out != NULL && out_len > 0 && ret > sizeof(nn_trans_hdr_t)) {
             memcpy(out, body + sizeof(nn_trans_hdr_t), out_len > trans_hdr->len ? trans_hdr->len : out_len);
         }
@@ -445,176 +468,296 @@ out:
     return ret;
 }
 
-/*******************************************TEST*********************************************/
-
-#define SERVER_WORKERS_MAX 1
-#define CLIENT_WORKERS_MAX 1
-#define CLIENT_SEND_COUND_MAX 50
-
-typedef enum {
-    CREATE = 0,
-    SET_DATA_SOURCE,
-    PREPARE,
-    START,
-    PAUSE,
-    STOP,
-    RELEASE,
-    ISPLAYING
-} media_trans_type_t;
-
-
-static uint64_t milliseconds(void)
+void* nn_pub_create(const char* name)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (((uint64_t)tv.tv_sec * 1000) + ((uint64_t)tv.tv_usec / 1000));
+    int ret = 0;
+    nn_pub_ctx_t* ctx = NULL;
+    int name_len = strlen(name);
+    const nn_nuttx_trans_type_t trans_type = NN_NUTTX_TRANS_TYPE_INPROC;
+
+    if (name_len <= 0) {
+        ret = -EINVAL;
+        goto err;
+    }
+
+    ctx = calloc(1, sizeof(nn_server_ctx_t));
+
+    if (ctx == NULL) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    ctx->fd = -1;
+    ctx->name = calloc(1, strlen(nn_nuttx_trans_prefix_str[trans_type] + name_len + 1));
+
+    if (ctx->name == NULL) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    strcpy(ctx->name, nn_nuttx_trans_prefix_str[trans_type]);
+    strcat(ctx->name, name);
+
+    ret = nn_socket_bind(&ctx->fd, ctx->name, AF_SP, NN_PUB);
+
+    if (ret < 0) {
+        goto err;
+    }
+
+    return ctx;
+err:
+    fprintf(stderr, "%s.ret=%d(%s)\n", __func__, ret, nn_strerror(ret));
+
+    if (ctx != NULL) {
+        if (ctx->fd != 0) {
+            nn_close(ctx->fd);
+        }
+
+        if (ctx->name != NULL) {
+            free(ctx->name);
+        }
+
+        free(ctx);
+    }
+
+    return NULL;
+}
+
+int nn_pub_release(void* nn_pub_ctx)
+{
+    if (nn_pub_ctx != NULL) {
+        nn_pub_ctx_t* ctx = (nn_pub_ctx_t*)nn_pub_ctx;
+
+        if (ctx->fd >= 0) {
+            nn_close(ctx->fd);
+            ctx->fd = -1;
+        }
+
+        if (ctx->name != NULL) {
+            free(ctx->name);
+            ctx->name = NULL;
+        }
+
+        free(ctx);
+    }
 }
 
 
-static int media_server_on_transaction(void* cookie, int code, nn_trans_data_t* data)
+
+int nn_pub_topic_msg(void* nn_pub_ctx, const void* topic, size_t topic_len, const void* content, size_t content_len)
 {
     int ret = 0;
+    int send_len = 0;
+    nn_pub_ctx_t* ctx = (nn_pub_ctx_t*)nn_pub_ctx;
+    nn_nuttx_topic_t* topic_data;
 
-    switch (code) {
-    case CREATE:
-        fprintf(stdout, "media_server.create.name=%s\n", (char*)data->in);
-        data->out = malloc(strlen("created"));
-        memcpy(data->out, "created", strlen("created"));
-        data->out_size = strlen("created");
-        break;
+    if(topic == NULL || ctx == NULL || ctx->fd < 0 /*|| ctx->proto != NN_PUB*/) {
+        return -EINVAL;
+    }
 
-    case SET_DATA_SOURCE:
-        fprintf(stdout, "media_server.set_data_source.url=%s\n", (char*)data->in);
-        break;
+    send_len = sizeof(nn_nuttx_topic_t) + content_len;
+    topic_data = (nn_nuttx_topic_t*)calloc(1, send_len);
+    if (topic_data == NULL) {
+        return -ENOMEM;
+    }
+    memcpy(topic_data->topic, topic, topic_len > NN_NUTTX_TOPIC_NAME_LEN? NN_NUTTX_TOPIC_NAME_LEN : topic_len);
+    topic_data->content_len = content_len;
+    memcpy(topic_data->content, content, content_len);
 
-    case PREPARE:
-        fprintf(stdout, "media_server.prepare\n");
-        break;
+    ret = nn_send(ctx->fd, topic_data, send_len, 0);
+    free(topic_data);
 
-    case START:
-        fprintf(stdout, "media_server.start\n");
-        break;
+    if (ret != send_len) {
+        fprintf(stderr, "%s.ret=%d, send_len=%d\n", __func__, ret, send_len);
+        return -1;
+    }
 
-    case PAUSE:
-        fprintf(stdout, "media_server.pause\n");
-        break;
+    return 0;
+}
 
-    case STOP:
-        fprintf(stdout, "media_server.stop\n");
-        break;
+static void* nn_sub_worker(void* arg)
+{
+    nn_nuttx_topic_t* topic;
+    nn_sub_ctx_t* ctx = (nn_sub_ctx_t*)arg;
+    pthread_detach(pthread_self());
 
-    case RELEASE:
-        fprintf(stdout, "media_server.release\n");
-        break;
+    if (NULL == ctx) {
+        return NULL;
+    }
 
-    case ISPLAYING:
-        fprintf(stdout, "media_server.isplaying\n");
-        data->out = malloc(sizeof(int));
-        *(int*)data->out = 1;
-        data->out_size = sizeof(int);
-        break;
+    prctl(PR_SET_NAME, strstr(ctx->name, "//") + 2, NULL, NULL, NULL);
 
-    default:
-        break;
+    while (1) {
+        int rc;
+        uint8_t* body;
+        void* control = NULL;
+        struct nn_iovec iov;
+        struct nn_msghdr hdr;
+
+        memset(&hdr, 0, sizeof(hdr));
+        iov.iov_base = &body;
+        iov.iov_len = NN_MSG;
+        hdr.msg_iov = &iov;
+        hdr.msg_iovlen = 1;
+        hdr.msg_control = &control;
+        hdr.msg_controllen = NN_MSG;
+        rc = nn_recvmsg(ctx->fd, &hdr, 0);
+
+        if (rc < 0) {
+            fprintf(stderr, "%s: %s\n", __func__, nn_strerror(nn_errno()));
+
+            if (nn_errno() == EBADF) {
+                break;   /* Socket closed by another thread. */
+            } else {
+                //TODO timeout or others
+                break;
+            }
+        }
+
+        topic = (nn_nuttx_topic_t*)body;
+
+        if (sizeof(nn_nuttx_topic_t) + topic->content_len != rc) {
+            fprintf(stderr, "%s.content_len=%lu, rc=%d\n", __func__, topic->content_len, rc);
+            nn_freemsg(body);
+            nn_freemsg(control);
+            continue;
+        } else {
+            if (ctx->listener != NULL) {
+                void* content = body + sizeof(nn_nuttx_topic_t);
+                ctx->listener(ctx->priv, topic->topic, NN_NUTTX_TOPIC_NAME_LEN, content, topic->content_len);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+void* nn_sub_connect(const char* name, on_topic_listener listener, void* listener_priv)
+{
+    int ret = 0;
+    nn_sub_ctx_t* ctx = NULL;
+    int name_len = strlen(name);
+    const nn_nuttx_trans_type_t trans_type = NN_NUTTX_TRANS_TYPE_INPROC;
+
+    if (name_len <= 0) {
+        ret = -EINVAL;
+        goto err;
+    }
+
+    ctx = calloc(1, sizeof(nn_sub_ctx_t));
+
+    if (ctx == NULL) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    ctx->name = calloc(1, strlen(nn_nuttx_trans_prefix_str[trans_type] + name_len + 1));
+
+    if (ctx->name == NULL) {
+        ret = -ENOMEM;
+        goto err;
+    }
+
+    strcpy(ctx->name, nn_nuttx_trans_prefix_str[trans_type]);
+    strcat(ctx->name, name);
+
+    ret = nn_socket_connect(&ctx->fd, ctx->name, AF_SP, NN_SUB);
+
+    if (ret < 0) {
+        goto err;
+    }
+
+    ctx->listener = listener;
+    ctx->priv = listener_priv;
+
+    ret = pthread_create(&ctx->tid, NULL, nn_sub_worker, (void*)ctx);
+
+    if (0 == ret) {
+        return ctx;
+    }
+
+err:
+    fprintf(stderr, "%s.ret=%d(%s)\n", __func__, ret, nn_strerror(ret));
+
+    if (ctx != NULL) {
+        if (ctx->fd != 0) {
+            nn_close(ctx->fd);
+        }
+
+        if (ctx->name != NULL) {
+            free(ctx->name);
+        }
+
+        free(ctx);
+    }
+
+    return NULL;
+}
+
+void nn_sub_disconnect(void* nn_sub_ctx)
+{
+    if (nn_sub_ctx != NULL) {
+        nn_sub_ctx_t* ctx = (nn_sub_ctx_t*)nn_sub_ctx;
+        ctx->actived = false;
+
+        if (ctx->fd >= 0) {
+            nn_close(ctx->fd);
+            ctx->fd = -1;
+        }
+
+        pthread_join(ctx->tid, NULL);
+
+        if (ctx->name != NULL) {
+            free(ctx->name);
+            ctx->name = NULL;
+        }
+
+        free(ctx);
+    }
+}
+
+
+int nn_sub_register_topic(void* nn_sub_ctx, const void* topic, size_t topic_len)
+{
+    int ret = 0;
+    nn_sub_ctx_t* ctx = (nn_sub_ctx_t*)nn_sub_ctx;
+
+    if (topic == NULL || ctx == NULL || ctx->fd < 0 /* || ctx->proto != NN_SUB*/) {
+        return -EINVAL;
+    }
+
+    if (topic_len > NN_NUTTX_TOPIC_NAME_LEN) {
+        fprintf(stderr, "%s.topic len(%lu) > max(%d)\n", __func__, topic_len, NN_NUTTX_TOPIC_NAME_LEN);
+        topic_len = NN_NUTTX_TOPIC_NAME_LEN;
+    }
+
+    ret = nn_setsockopt(ctx->fd, NN_SUB, NN_SUB_SUBSCRIBE, topic, topic_len);
+    if (ret < 0) {
+        fprintf(stderr, "%s.ret=%d(%s)\n", __func__, ret, nn_strerror(ret));
     }
 
     return ret;
 }
 
-int client(const char* url, const char* name, int protocol)
+int nn_sub_unregister_topic(void* nn_sub_ctx, const void* topic, size_t topic_len)
 {
-    int rc = 0;
-    void* client = nn_client_connect(url, NN_NUTTX_MODE_REQREP, protocol);
+    int ret = 0;
+    nn_sub_ctx_t* ctx = (nn_sub_ctx_t*)nn_sub_ctx;
 
-    if (client != NULL) {
-        char out[15] = {0};
-        int  is_playing = 0;
-        fprintf(stderr, "client connected\n");
-        rc = nn_client_transaction(client, CREATE, name, strlen(name), out, sizeof(out));
-
-        if (rc != 0) {
-            fprintf(stdout, "player.name=%s, create.error=%d\n", name, rc);
-        } else {
-            fprintf(stdout, "player.name=%s, create.out=%s\n", name, out);
-        }
-
-        rc = nn_client_transaction(client, SET_DATA_SOURCE, "http://253.mp3", strlen("http://253.mp3"), NULL, 0);
-
-        if (rc != 0) {
-            fprintf(stdout, "player.name=%s, set_data_source.error=%d\n", name, rc);
-        }
-
-        rc = nn_client_transaction(client, PREPARE, NULL, 0, NULL, 0);
-
-        if (rc != 0) {
-            fprintf(stdout, "player.name=%s, prepare.error=%d\n", name, rc);
-        }
-
-        rc = nn_client_transaction(client, START, NULL, 0, NULL, 0);
-
-        if (rc != 0) {
-            fprintf(stdout, "player.name=%s, start.error=%d\n", name, rc);
-        }
-
-        rc = nn_client_transaction(client, ISPLAYING, NULL, 0, &is_playing, sizeof(is_playing));
-
-        if (rc != 0) {
-            fprintf(stdout, "player.name=%s, isplaying.error=%d\n", name, rc);
-        } else {
-            fprintf(stdout, "player.name=%s, isplaying=%d\n", name, is_playing);
-        }
+    if (topic == NULL || ctx == NULL || ctx->fd < 0 /* || ctx->proto != NN_SUB*/) {
+        return -EINVAL;
     }
 
-    nn_client_disconnect(client);
-    return rc;
+    if (topic_len > NN_NUTTX_TOPIC_NAME_LEN) {
+        fprintf(stderr, "%s.topic len(%lu) > max(%d)\n", __func__, topic_len, NN_NUTTX_TOPIC_NAME_LEN);
+        topic_len = NN_NUTTX_TOPIC_NAME_LEN;
+    }
+
+    ret = nn_setsockopt(ctx->fd, NN_SUB, NN_SUB_UNSUBSCRIBE, topic, topic_len);
+    if (ret < 0) {
+        fprintf(stderr, "%s.ret=%d(%s)\n", __func__, ret, nn_strerror(ret));
+    }
+
+    return ret;
 }
 
-int main(int argc, char** argv)
-{
-    int rc;
-    bool inproc = false;
-    void* server = NULL;
-    const char* name = NULL;
-
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <url> [-s|name]\n", argv[0]);
-        exit(EXIT_FAILURE);
-    }
-
-    inproc = (strstr(argv[1], "inproc") != NULL);
-    name = strstr(argv[1], "//") + 2;
-
-    if (inproc) {
-        server = nn_server_create(name, NN_NUTTX_MODE_REQREP, NN_NUTTX_PROTOCOL_INPROC);
-
-        if (server == NULL) {
-            fprintf(stderr, "server start failed\n");
-        } else {
-            fprintf(stderr, "server start success\n");
-            nn_server_set_transaction_cb(server, media_server_on_transaction);
-            rc = client(name, argv[2], NN_NUTTX_PROTOCOL_INPROC);
-
-            if (rc != 0) {
-                fprintf(stderr, "client start failed, ret=%d\n", rc);
-            }
-        }
-    } else {
-        if (strcmp(argv[2], "-s") == 0) {
-            server = nn_server_create(name, NN_NUTTX_MODE_REQREP, NN_NUTTX_PROTOCOL_IPC);
-
-            if (server == NULL) {
-                fprintf(stderr, "server start failed\n");
-            } else {
-                nn_server_set_transaction_cb(server, media_server_on_transaction);
-            }
-        } else {
-            rc = client(name, argv[2], NN_NUTTX_PROTOCOL_IPC);
-        }
-    }
-
-    if (server != NULL) {
-        nn_server_release(server);
-    }
-
-    exit(rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
-}
