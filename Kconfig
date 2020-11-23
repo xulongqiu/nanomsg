@@ -1,0 +1,72 @@
+#
+# For a description of the syntax of this configuration file,
+# see kconfig-language at https://www.kernel.org/doc/Documentation/kbuild/kconfig-language.txt
+#
+
+config NANOMSG
+	tristate "enable nanomsg library"
+	default n
+
+if NANOMSG
+
+config NANOMSG_PROTOCOL_PAIR
+    tristate "enable nanomsg protocol pair"
+    default n
+
+config NANOMSG_PROTOCOL_PUBSUB
+    tristate "enable nanomsg protocol pubsub"
+    default y
+
+config NANOMSG_PROTOCOL_REQREP
+    tristate "enable nanomsg protocol reqrep"
+    default y
+
+config NANOMSG_PROTOCOL_PIPELINE
+    tristate "enable nanomsg protocol pipeline"
+    default n
+
+config NANOMSG_PROTOCOL_BUS
+    tristate "enable nanomsg protocol bus"
+    default n
+
+config NANOMSG_PROTOCOL_SURVEY
+    tristate "enable nanomsg protocol survey"
+    default n
+
+config NANOMSG_TRANSPORT_INPROC
+    tristate "enable nanomsg transport inproc"
+    default y
+
+config NANOMSG_TRANSPORT_IPC
+    tristate "enable nanomsg transport ipc"
+    default n
+
+config NANOMSG_TRANSPORT_TCP
+    tristate "enable nanomsg transport tcp"
+    default n
+
+config NANOMSG_TRANSPORT_WS
+    tristate "enable nanomsg transport web socket"
+    default n
+
+config NANOMSG_DEMO
+    tristate "enable nanomsg demo"
+    default n
+
+if NANOMSG_DEMO
+
+config NANOMSG_DEMO_PROGNAME
+	string "program name"
+	default "nn_demo"
+
+config NANOMSG_DEMO_PRIORITY
+	int "task priority"
+	default 100
+
+config NANOMSG_DEMO_STACKSIZE
+	int "stack size"
+	default 2048
+
+endif #NANOMSG_DEMO
+
+endif #NANOMSG
