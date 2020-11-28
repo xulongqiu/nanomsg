@@ -30,7 +30,7 @@
 /*  This class is a simple uni-directional message queue. */
 
 /*  It's not 128 so that chunk including its footer fits into a memory page. */
-#define NN_MSGQUEUE_GRANULARITY 126
+#define NN_MSGQUEUE_GRANULARITY 12
 
 struct nn_msgqueue_chunk {
     struct nn_msg msgs [NN_MSGQUEUE_GRANULARITY];

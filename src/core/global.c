@@ -104,26 +104,38 @@ extern struct nn_socktype nn_xbus_socktype;
 
 /*  Array of known socket types. */
 const struct nn_socktype *nn_socktypes[] = {
+#ifdef NN_PROTOCOL_PAIR
     &nn_pair_socktype,
     &nn_xpair_socktype,
+#endif
+#ifdef NN_PROTOCOL_PUBSUB
     &nn_pub_socktype,
     &nn_sub_socktype,
     &nn_xpub_socktype,
     &nn_xsub_socktype,
+#endif
+#ifdef NN_PROTOCOL_REQREP
     &nn_rep_socktype,
     &nn_req_socktype,
     &nn_xrep_socktype,
     &nn_xreq_socktype,
+#endif
+#ifdef NN_PROTOCOL_PIPELINE
     &nn_push_socktype,
     &nn_xpush_socktype,
     &nn_pull_socktype,
     &nn_xpull_socktype,
+#endif
+#ifdef NN_PROTOCOL_SURVEY
     &nn_respondent_socktype,
     &nn_surveyor_socktype,
     &nn_xrespondent_socktype,
     &nn_xsurveyor_socktype,
+#endif
+#ifdef NN_PROTOCOL_BUS
     &nn_bus_socktype,
     &nn_xbus_socktype,
+#endif
     NULL,
 };
 
@@ -136,10 +148,18 @@ extern struct nn_transport nn_tcp;
 extern struct nn_transport nn_ws;
 
 const struct nn_transport *nn_transports[] = {
+#ifdef NN_TRANSPORT_INPROC
     &nn_inproc,
+#endif
+#ifdef NN_TRANSPORT_IPC
     &nn_ipc,
+#endif
+#ifdef NN_TRANSPORT_TCP
     &nn_tcp,
+#endif
+#ifdef NN_TRANSPORT_WS
     &nn_ws,
+#endif
     NULL,
 };
 

@@ -37,6 +37,7 @@ void nn_msgqueue_init (struct nn_msgqueue *self, size_t maxmem)
     self->maxmem = maxmem;
 
     chunk = nn_alloc (sizeof (struct nn_msgqueue_chunk), "msgqueue chunk");
+    fprintf(stderr, "%s-%d.bytes=%d\n", __func__, __LINE__, sizeof (struct nn_msgqueue_chunk));
     alloc_assert (chunk);
     chunk->next = NULL;
 
